@@ -1,8 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { FastForward, FlipHorizontal, Pause, Play, RotateCcw } from 'lucide-react';
+import { DEFAULT_JOINT_ANGLES, extractJointAngles } from '../lib/pose/geometry';
 import { findClosestFrame } from '../lib/pose/interpolator';
+import { getSharedPoseLandmarker } from '../lib/pose/landmarker';
 import { drawPoseOnCanvas } from '../lib/pose/renderer';
-import type { DanceSequence, JointName } from '../lib/pose/types';
+import type { DanceSequence, JointName, NormalizedLandmark, PoseFrameData } from '../lib/pose/types';
 
 interface VideoComparisonViewerProps {
   modelSeq: DanceSequence;
@@ -10,6 +12,31 @@ interface VideoComparisonViewerProps {
   currentTime: number;
   onTimeUpdate: (time: number) => void;
   activeDiscrepancies?: JointName[];
+}
+
+/**
+ * 昇順を保ちながらフレームを挿入するヘルパー（重複時刻は上書き）
+ */
+function insertFrameSorted(frames: PoseFrameData[], newFrame: PoseFrameData) {
+  const t = newFrame.timestamp;
+  let low = 0;
+  let high = frames.length - 1;
+
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    const diff = frames[mid].timestamp - t;
+    if (Math.abs(diff) <= 0.03) {
+      frames[mid] = newFrame;
+      return;
+    }
+    if (diff < 0) {
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  frames.splice(low, 0, newFrame);
 }
 
 export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
@@ -25,13 +52,45 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
   const modelCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const userCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  const [isPlaying, setIsPlaying] = useState<boolean>(false);
+  const [isPlaying, setIsPlaying] = useState<boolean>(true);
   const [playbackRate, setPlaybackRate] = useState<number>(1.0);
   const [mirrorUser, setMirrorUser] = useState<boolean>(false);
 
+  const [modelAspect, setModelAspect] = useState<number | null>(
+    modelSeq.width && modelSeq.height ? modelSeq.width / modelSeq.height : null
+  );
+  const [userAspect, setUserAspect] = useState<number | null>(
+    userSeq.width && userSeq.height ? userSeq.width / userSeq.height : null
+  );
+
+  const landmarkerRef = useRef<any>(null);
+  const isInferringModelRef = useRef<boolean>(false);
+  const isInferringUserRef = useRef<boolean>(false);
+  const lastInferModelTimeRef = useRef<number>(0);
+  const lastInferUserTimeRef = useRef<number>(0);
+
+  const latestModelLandmarksRef = useRef<NormalizedLandmark[] | null>(null);
+  const latestUserLandmarksRef = useRef<NormalizedLandmark[] | null>(null);
+  const latestModelAnglesRef = useRef<any>(null);
+  const latestUserAnglesRef = useRef<any>(null);
+
   const maxDuration = Math.max(modelSeq.duration, userSeq.duration) || 1;
 
-  // 再生/一時停止の制御
+  // 共有MediaPipeインスタンスの読み込み
+  useEffect(() => {
+    let active = true;
+    getSharedPoseLandmarker()
+      .then((instance) => {
+        if (active) landmarkerRef.current = instance;
+      })
+      .catch((err) => console.warn('Failed to load shared pose landmarker for comparison:', err));
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // 再生/一時停止
   const togglePlay = () => {
     setIsPlaying((prev) => !prev);
   };
@@ -44,8 +103,8 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
     if (isPlaying) {
       mv.playbackRate = playbackRate;
       uv.playbackRate = playbackRate;
-      mv.play().catch((e) => console.warn('Model play error:', e));
-      uv.play().catch((e) => console.warn('User play error:', e));
+      mv.play().catch(() => {});
+      uv.play().catch(() => {});
     } else {
       mv.pause();
       uv.pause();
@@ -72,7 +131,7 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
 
   // 速度変更
   const cyclePlaybackRate = () => {
-    const rates = [1.0, 0.5];
+    const rates = [1.0, 0.75, 0.5];
     const nextIdx = (rates.indexOf(playbackRate) + 1) % rates.length;
     setPlaybackRate(rates[nextIdx]);
   };
@@ -84,7 +143,7 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
     if (userVideoRef.current) userVideoRef.current.currentTime = 0;
   };
 
-  // 【超爆速・負荷0.1ms】同期アニメーションループ（AI推論ゼロ・高速Canvas線画描画のみ）
+  // 【同期描画ループ（60fps描画 & 20fpsリアルタイム推論 & アスペクト比完全吸着）】
   const lastStateUpdateTimeRef = useRef<number>(0);
 
   useEffect(() => {
@@ -96,25 +155,23 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
       const mc = modelCanvasRef.current;
       const uc = userCanvasRef.current;
 
+      const now = performance.now();
+
       // 再生時刻の同期更新（100msスロットリングでReact負荷を90%削減）
       if (mv && isPlaying) {
-        const now = performance.now();
         if (now - lastStateUpdateTimeRef.current > 100) {
           lastStateUpdateTimeRef.current = now;
           onTimeUpdate(mv.currentTime);
         }
-        if (mv.ended || (uv && uv.ended)) {
-          setIsPlaying(false);
-        }
       }
 
-      // 1. お手本動画の骨格描画（所要時間0.05ms）
-      let modelFrameData = null;
+      // 1. お手本動画の解像度同期 & 骨格追従
       if (mv && mc && mv.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
         if (mv.videoWidth > 0 && mv.videoHeight > 0) {
           if (mc.width !== mv.videoWidth || mc.height !== mv.videoHeight) {
             mc.width = mv.videoWidth;
             mc.height = mv.videoHeight;
+            if (!modelAspect) setModelAspect(mv.videoWidth / mv.videoHeight);
           }
         }
 
@@ -122,24 +179,63 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
         if (mctx && mc.width > 0 && mc.height > 0) {
           mctx.clearRect(0, 0, mc.width, mc.height);
 
-          if (modelSeq.frames.length > 0) {
-            modelFrameData = findClosestFrame(modelSeq.frames, mv.currentTime);
-            if (modelFrameData) {
-              drawPoseOnCanvas(mctx, modelFrameData.landmarks, {
-                mirror: false,
-                glowEffect: true,
-              });
+          const mt = mv.currentTime;
+          const cachedModel = findClosestFrame(modelSeq.frames, mt);
+          let modelLandmarks: NormalizedLandmark[] | null = null;
+
+          if (cachedModel && Math.abs(cachedModel.timestamp - mt) <= 0.06) {
+            modelLandmarks = cachedModel.landmarks;
+            latestModelLandmarksRef.current = cachedModel.landmarks;
+            latestModelAnglesRef.current = cachedModel.angles;
+          } else {
+            // キャッシュ未検出時はリアルタイム推論（20fps）
+            if (
+              landmarkerRef.current &&
+              !isInferringModelRef.current &&
+              now - lastInferModelTimeRef.current >= 45
+            ) {
+              isInferringModelRef.current = true;
+              try {
+                const res = landmarkerRef.current.detect(mv);
+                if (res.landmarks && res.landmarks.length > 0) {
+                  const lms = res.landmarks[0];
+                  latestModelLandmarksRef.current = lms;
+                  modelLandmarks = lms;
+                  const angles = extractJointAngles(lms) || DEFAULT_JOINT_ANGLES;
+                  latestModelAnglesRef.current = angles;
+                  insertFrameSorted(modelSeq.frames, {
+                    timestamp: mt,
+                    landmarks: lms,
+                    angles,
+                  });
+                }
+              } catch (_) {
+              } finally {
+                isInferringModelRef.current = false;
+                lastInferModelTimeRef.current = performance.now();
+              }
             }
+            if (!modelLandmarks && latestModelLandmarksRef.current) {
+              modelLandmarks = latestModelLandmarksRef.current;
+            }
+          }
+
+          if (modelLandmarks) {
+            drawPoseOnCanvas(mctx, modelLandmarks, {
+              mirror: false,
+              glowEffect: true,
+            });
           }
         }
       }
 
-      // 2. 提出動画の骨格描画（所要時間0.05ms・ズレ部位ハイライト）
+      // 2. 提出動画の解像度同期 & 骨格追従 & リアルタイムズレ検知
       if (uv && uc && uv.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
         if (uv.videoWidth > 0 && uv.videoHeight > 0) {
           if (uc.width !== uv.videoWidth || uc.height !== uv.videoHeight) {
             uc.width = uv.videoWidth;
             uc.height = uv.videoHeight;
+            if (!userAspect) setUserAspect(uv.videoWidth / uv.videoHeight);
           }
         }
 
@@ -147,37 +243,76 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
         if (uctx && uc.width > 0 && uc.height > 0) {
           uctx.clearRect(0, 0, uc.width, uc.height);
 
-          if (userSeq.frames.length > 0) {
-            const userFrameData = findClosestFrame(userSeq.frames, uv.currentTime);
-            if (userFrameData) {
-              // 角度のリアルタイムズレ検知（8回の引き算のみ、0.0001ms）
-              let currentDiscrepancies = [...activeDiscrepancies];
-              if (modelFrameData && modelFrameData.angles && userFrameData.angles) {
-                const ma = modelFrameData.angles;
-                const ua = userFrameData.angles;
-                const liveDiscrepant: JointName[] = [];
-                const checkJoint = (j: JointName) => {
-                  if (Math.abs(ma[j] - ua[j]) > 42) {
-                    liveDiscrepant.push(j);
-                  }
-                };
-                checkJoint('leftElbow');
-                checkJoint('rightElbow');
-                checkJoint('leftShoulder');
-                checkJoint('rightShoulder');
-                checkJoint('leftHip');
-                checkJoint('rightHip');
-                checkJoint('leftKnee');
-                checkJoint('rightKnee');
-                currentDiscrepancies = Array.from(new Set([...currentDiscrepancies, ...liveDiscrepant]));
-              }
+          const ut = uv.currentTime;
+          const cachedUser = findClosestFrame(userSeq.frames, ut);
+          let userLandmarks: NormalizedLandmark[] | null = null;
 
-              drawPoseOnCanvas(uctx, userFrameData.landmarks, {
-                mirror: mirrorUser,
-                activeDiscrepancies: currentDiscrepancies,
-                glowEffect: true,
-              });
+          if (cachedUser && Math.abs(cachedUser.timestamp - ut) <= 0.06) {
+            userLandmarks = cachedUser.landmarks;
+            latestUserLandmarksRef.current = cachedUser.landmarks;
+            latestUserAnglesRef.current = cachedUser.angles;
+          } else {
+            // キャッシュ未検出時はリアルタイム推論（20fps）
+            if (
+              landmarkerRef.current &&
+              !isInferringUserRef.current &&
+              now - lastInferUserTimeRef.current >= 45
+            ) {
+              isInferringUserRef.current = true;
+              try {
+                const res = landmarkerRef.current.detect(uv);
+                if (res.landmarks && res.landmarks.length > 0) {
+                  const lms = res.landmarks[0];
+                  latestUserLandmarksRef.current = lms;
+                  userLandmarks = lms;
+                  const angles = extractJointAngles(lms) || DEFAULT_JOINT_ANGLES;
+                  latestUserAnglesRef.current = angles;
+                  insertFrameSorted(userSeq.frames, {
+                    timestamp: ut,
+                    landmarks: lms,
+                    angles,
+                  });
+                }
+              } catch (_) {
+              } finally {
+                isInferringUserRef.current = false;
+                lastInferUserTimeRef.current = performance.now();
+              }
             }
+            if (!userLandmarks && latestUserLandmarksRef.current) {
+              userLandmarks = latestUserLandmarksRef.current;
+            }
+          }
+
+          if (userLandmarks) {
+            // お手本と提出動画の角度をリアルタイム比較（40度以上の明確なズレのみ赤発光）
+            let currentDiscrepancies = [...activeDiscrepancies];
+            const ma = latestModelAnglesRef.current;
+            const ua = latestUserAnglesRef.current;
+
+            if (ma && ua) {
+              const liveDiscrepant: JointName[] = [];
+              const checkJoint = (j: JointName) => {
+                if (Math.abs(ma[j] - ua[j]) > 40) {
+                  liveDiscrepant.push(j);
+                }
+              };
+              checkJoint('leftElbow');
+              checkJoint('rightElbow');
+              checkJoint('leftShoulder');
+              checkJoint('rightShoulder');
+              checkJoint('leftHip');
+              checkJoint('rightHip');
+              checkJoint('leftKnee');
+              checkJoint('rightKnee');
+              currentDiscrepancies = Array.from(new Set([...currentDiscrepancies, ...liveDiscrepant]));
+            }
+
+            drawPoseOnCanvas(uctx, userLandmarks, {
+              mirror: mirrorUser,
+              activeDiscrepancies: currentDiscrepancies,
+              glowEffect: true,
+            });
           }
         }
       }
@@ -190,34 +325,51 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
     return () => {
       if (animId) cancelAnimationFrame(animId);
     };
-  }, [isPlaying, modelSeq, userSeq, activeDiscrepancies, mirrorUser, onTimeUpdate]);
+  }, [isPlaying, modelSeq, userSeq, activeDiscrepancies, mirrorUser, onTimeUpdate, modelAspect, userAspect]);
 
   return (
     <div className="w-full flex flex-col gap-4">
       {/* 2画面サイドバイサイド動画エリア */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 h-[42vh] sm:h-[48vh]">
         {/* 左側: お手本動画 */}
-        <div className="relative w-full h-full bg-zinc-900 rounded-3xl overflow-hidden flex items-center justify-center shadow-xl">
+        <div className="relative w-full h-full bg-zinc-950 rounded-3xl overflow-hidden flex items-center justify-center shadow-xl">
           <div className="absolute top-4 left-4 z-20 px-3 py-1 rounded-full bg-zinc-950/80 backdrop-blur-md text-[10px] font-bold tracking-widest uppercase text-zinc-300">
-            REFERENCE ({modelSeq.frames.length} POSES)
+            REFERENCE DANCE
           </div>
-          <video
-            ref={modelVideoRef}
-            src={modelSeq.videoUrl}
-            playsInline
-            muted
-            className="w-full h-full object-contain"
-          />
-          <canvas
-            ref={modelCanvasRef}
-            className="absolute inset-0 w-full h-full object-contain pointer-events-none"
-          />
+
+          <div
+            className="relative max-w-full max-h-full flex items-center justify-center overflow-hidden"
+            style={{
+              aspectRatio: modelAspect ? `${modelAspect}` : undefined,
+              width: modelAspect && modelAspect > 1 ? '100%' : 'auto',
+              height: modelAspect && modelAspect <= 1 ? '100%' : 'auto',
+            }}
+          >
+            <video
+              ref={modelVideoRef}
+              src={modelSeq.videoUrl}
+              playsInline
+              muted
+              loop
+              onLoadedMetadata={() => {
+                const v = modelVideoRef.current;
+                if (v && v.videoWidth > 0 && v.videoHeight > 0) {
+                  setModelAspect(v.videoWidth / v.videoHeight);
+                }
+              }}
+              className="w-full h-full block object-contain"
+            />
+            <canvas
+              ref={modelCanvasRef}
+              className="absolute inset-0 w-full h-full pointer-events-none"
+            />
+          </div>
         </div>
 
         {/* 右側: 提出動画 */}
-        <div className="relative w-full h-full bg-zinc-900 rounded-3xl overflow-hidden flex items-center justify-center shadow-xl">
+        <div className="relative w-full h-full bg-zinc-950 rounded-3xl overflow-hidden flex items-center justify-center shadow-xl">
           <div className="absolute top-4 left-4 z-20 px-3 py-1 rounded-full bg-zinc-950/80 backdrop-blur-md text-[10px] font-bold tracking-widest uppercase text-zinc-300">
-            YOUR DANCE ({userSeq.frames.length} POSES)
+            YOUR DANCE
           </div>
 
           {/* ミラートグルボタン */}
@@ -234,21 +386,37 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
             <span>MIRROR</span>
           </button>
 
-          <video
-            ref={userVideoRef}
-            src={userSeq.videoUrl}
-            playsInline
-            muted
-            className={`w-full h-full object-contain ${mirrorUser ? 'scale-x-[-1]' : ''}`}
-          />
-          <canvas
-            ref={userCanvasRef}
-            className="absolute inset-0 w-full h-full object-contain pointer-events-none"
-          />
+          <div
+            className="relative max-w-full max-h-full flex items-center justify-center overflow-hidden"
+            style={{
+              aspectRatio: userAspect ? `${userAspect}` : undefined,
+              width: userAspect && userAspect > 1 ? '100%' : 'auto',
+              height: userAspect && userAspect <= 1 ? '100%' : 'auto',
+            }}
+          >
+            <video
+              ref={userVideoRef}
+              src={userSeq.videoUrl}
+              playsInline
+              muted
+              loop
+              onLoadedMetadata={() => {
+                const v = userVideoRef.current;
+                if (v && v.videoWidth > 0 && v.videoHeight > 0) {
+                  setUserAspect(v.videoWidth / v.videoHeight);
+                }
+              }}
+              className={`w-full h-full block object-contain ${mirrorUser ? 'scale-x-[-1]' : ''}`}
+            />
+            <canvas
+              ref={userCanvasRef}
+              className="absolute inset-0 w-full h-full pointer-events-none"
+            />
+          </div>
         </div>
       </div>
 
-      {/* 共通コントロールバー */}
+      {/* 共通コントロールバー（ボーダーレス・アイコンファースト） */}
       <div className="w-full bg-zinc-900/95 backdrop-blur-xl px-5 py-3 rounded-full flex items-center gap-4 shadow-xl">
         {/* 再生/一時停止 */}
         <button

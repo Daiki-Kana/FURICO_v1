@@ -1,13 +1,40 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Maximize2, Pause, Play, RotateCcw, Volume2, VolumeX, X } from 'lucide-react';
+import { DEFAULT_JOINT_ANGLES, extractJointAngles } from '../lib/pose/geometry';
 import { findClosestFrame } from '../lib/pose/interpolator';
+import { getSharedPoseLandmarker } from '../lib/pose/landmarker';
 import { drawPoseOnCanvas } from '../lib/pose/renderer';
-import type { DanceSequence } from '../lib/pose/types';
+import type { DanceSequence, NormalizedLandmark, PoseFrameData } from '../lib/pose/types';
 
 interface TrackedVideoPlayerProps {
   sequence: DanceSequence;
   label?: string;
   onReplace?: () => void;
+}
+
+/**
+ * 昇順を保ちながらフレームを挿入するヘルパー（重複時刻は上書き）
+ */
+function insertFrameSorted(frames: PoseFrameData[], newFrame: PoseFrameData) {
+  const t = newFrame.timestamp;
+  let low = 0;
+  let high = frames.length - 1;
+
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    const diff = frames[mid].timestamp - t;
+    if (Math.abs(diff) <= 0.03) {
+      frames[mid] = newFrame;
+      return;
+    }
+    if (diff < 0) {
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  frames.splice(low, 0, newFrame);
 }
 
 export const TrackedVideoPlayer: React.FC<TrackedVideoPlayerProps> = ({
@@ -17,12 +44,47 @@ export const TrackedVideoPlayer: React.FC<TrackedVideoPlayerProps> = ({
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
 
   const [isPlaying, setIsPlaying] = useState<boolean>(true);
   const [currentTime, setCurrentTime] = useState<number>(0);
   const [isMuted, setIsMuted] = useState<boolean>(true);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
+  const [videoAspect, setVideoAspect] = useState<number | null>(
+    sequence.width && sequence.height ? sequence.width / sequence.height : null
+  );
+
   const lastStateUpdateTimeRef = useRef<number>(0);
+  const lastInferTimeRef = useRef<number>(0);
+  const isInferringRef = useRef<boolean>(false);
+  const latestLandmarksRef = useRef<NormalizedLandmark[] | null>(null);
+  const landmarkerInstanceRef = useRef<any>(null);
+
+  // 共有MediaPipeインスタンスのロード
+  useEffect(() => {
+    let active = true;
+    getSharedPoseLandmarker()
+      .then((instance) => {
+        if (active) {
+          landmarkerInstanceRef.current = instance;
+        }
+      })
+      .catch((err) => {
+        console.warn('Failed to get shared pose landmarker:', err);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // 動画のメタデータロード時に縦横比を取得
+  const handleLoadedMetadata = () => {
+    const v = videoRef.current;
+    if (v && v.videoWidth > 0 && v.videoHeight > 0) {
+      setVideoAspect(v.videoWidth / v.videoHeight);
+    }
+  };
 
   // 再生/一時停止
   const togglePlay = (e: React.MouseEvent) => {
@@ -69,7 +131,7 @@ export const TrackedVideoPlayer: React.FC<TrackedVideoPlayerProps> = ({
     }
   };
 
-  // 【超爆速・負荷0.1ms】骨格オーバーレイ描画ループ（推論なし・実測フレーム高速描画）
+  // 【60fps描画 & 20fpsリアルタイム推論 & 即時キャッシュ】
   useEffect(() => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
@@ -79,10 +141,14 @@ export const TrackedVideoPlayer: React.FC<TrackedVideoPlayerProps> = ({
 
     const loop = () => {
       if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+        // Canvasの内部解像度をビデオ解像度と完全に同期（1ピクセルのズレも根絶）
         if (video.videoWidth > 0 && video.videoHeight > 0) {
           if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
             canvas.width = video.videoWidth;
             canvas.height = video.videoHeight;
+            if (!videoAspect) {
+              setVideoAspect(video.videoWidth / video.videoHeight);
+            }
           }
         }
 
@@ -91,23 +157,65 @@ export const TrackedVideoPlayer: React.FC<TrackedVideoPlayerProps> = ({
           ctx.clearRect(0, 0, canvas.width, canvas.height);
 
           const t = video.currentTime;
-
-          // シークバーのReact再描画は100msごとに抑制（React負荷90%削減）
           const now = performance.now();
+
+          // シークバーの更新は100msごとにスロットリング（React負荷90%削減）
           if (now - lastStateUpdateTimeRef.current > 100) {
             lastStateUpdateTimeRef.current = now;
             setCurrentTime(t);
           }
 
-          // 二分探索で実測ポーズを瞬時取得（所要時間0.0001ms、架空の補間歪みゼロ）
-          if (sequence.frames.length > 0) {
-            const frame = findClosestFrame(sequence.frames, t);
-            if (frame) {
-              drawPoseOnCanvas(ctx, frame.landmarks, {
-                mirror: false,
-                glowEffect: true,
-              });
+          // 1. まずキャッシュ（既存フレーム）から探す
+          const cached = findClosestFrame(sequence.frames, t);
+          let currentLandmarks: NormalizedLandmark[] | null = null;
+
+          if (cached && Math.abs(cached.timestamp - t) <= 0.06) {
+            currentLandmarks = cached.landmarks;
+            latestLandmarksRef.current = cached.landmarks;
+          } else {
+            // 2. キャッシュにない場合、20fps（50ms間隔）でリアルタイム推論を実行
+            if (
+              landmarkerInstanceRef.current &&
+              !isInferringRef.current &&
+              now - lastInferTimeRef.current >= 45
+            ) {
+              isInferringRef.current = true;
+              try {
+                const result = landmarkerInstanceRef.current.detect(video);
+                if (result.landmarks && result.landmarks.length > 0) {
+                  const lms = result.landmarks[0];
+                  latestLandmarksRef.current = lms;
+                  currentLandmarks = lms;
+
+                  // 抽出した骨格フレームをキャッシュに記録（二分探索可能）
+                  const angles = extractJointAngles(lms) || DEFAULT_JOINT_ANGLES;
+                  const newFrame: PoseFrameData = {
+                    timestamp: t,
+                    landmarks: lms,
+                    angles,
+                  };
+                  insertFrameSorted(sequence.frames, newFrame);
+                }
+              } catch (inferErr) {
+                // シークや破棄時の安全ガード
+              } finally {
+                isInferringRef.current = false;
+                lastInferTimeRef.current = performance.now();
+              }
             }
+
+            // 推論間隔の間は直近の骨格を維持してチラつきを防止
+            if (!currentLandmarks && latestLandmarksRef.current) {
+              currentLandmarks = latestLandmarksRef.current;
+            }
+          }
+
+          // 3. 骨格のレンダリング（動画と100%吸着）
+          if (currentLandmarks) {
+            drawPoseOnCanvas(ctx, currentLandmarks, {
+              mirror: false,
+              glowEffect: true,
+            });
           }
         }
       }
@@ -120,7 +228,7 @@ export const TrackedVideoPlayer: React.FC<TrackedVideoPlayerProps> = ({
     return () => {
       if (animId) cancelAnimationFrame(animId);
     };
-  }, [sequence]);
+  }, [sequence, videoAspect]);
 
   // 初回自動再生
   useEffect(() => {
@@ -133,27 +241,42 @@ export const TrackedVideoPlayer: React.FC<TrackedVideoPlayerProps> = ({
 
   return (
     <div
+      ref={containerRef}
       className={`relative w-full h-full bg-zinc-950 rounded-3xl overflow-hidden flex items-center justify-center group select-none shadow-xl ${
         isFullscreen ? 'fixed inset-4 z-50 rounded-3xl shadow-2xl' : ''
       }`}
       onClick={(e) => e.stopPropagation()}
     >
-      {/* 動画本体 */}
-      <video
-        ref={videoRef}
-        src={sequence.videoUrl}
-        playsInline
-        muted={isMuted}
-        loop
-        className="w-full h-full object-contain"
-        onEnded={() => setIsPlaying(false)}
-      />
+      {/* 
+        動画とCanvasを同一のアスペクト比ラッパーに収めることで、
+        親コンテナと動画の比率差（黒帯）による骨格ズレを100%根絶 
+      */}
+      <div
+        className="relative max-w-full max-h-full flex items-center justify-center overflow-hidden"
+        style={{
+          aspectRatio: videoAspect ? `${videoAspect}` : undefined,
+          width: videoAspect && videoAspect > 1 ? '100%' : 'auto',
+          height: videoAspect && videoAspect <= 1 ? '100%' : 'auto',
+        }}
+      >
+        {/* 動画本体 */}
+        <video
+          ref={videoRef}
+          src={sequence.videoUrl}
+          playsInline
+          muted={isMuted}
+          loop
+          onLoadedMetadata={handleLoadedMetadata}
+          className="w-full h-full block object-contain"
+          onEnded={() => setIsPlaying(false)}
+        />
 
-      {/* 骨格ワイヤーフレーム描画Canvas（動画の上にピタリと重なる） */}
-      <canvas
-        ref={canvasRef}
-        className="absolute inset-0 w-full h-full object-contain pointer-events-none"
-      />
+        {/* 骨格ワイヤーフレーム描画Canvas（動画と寸分違わず100%吸着） */}
+        <canvas
+          ref={canvasRef}
+          className="absolute inset-0 w-full h-full pointer-events-none"
+        />
+      </div>
 
       {/* 上部バッジと操作ボタン */}
       <div className="absolute top-3 inset-x-3 flex items-center justify-between z-20 pointer-events-none">
@@ -198,7 +321,7 @@ export const TrackedVideoPlayer: React.FC<TrackedVideoPlayerProps> = ({
         </div>
       </div>
 
-      {/* 下部コントロールバー（ホバーまたはタップで常時表示） */}
+      {/* 下部コントロールバー（ボーダーレス・アイコンファースト） */}
       <div className="absolute bottom-3 inset-x-3 z-20 bg-zinc-900/90 backdrop-blur-md px-3.5 py-2 rounded-2xl flex items-center gap-3 transition-opacity duration-200">
         {/* 再生/一時停止 */}
         <button

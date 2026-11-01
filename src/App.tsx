@@ -23,24 +23,19 @@ export function App() {
   const [evaluationReport, setEvaluationReport] = useState<VideoEvaluationReport | null>(null);
   const [currentTime, setCurrentTime] = useState<number>(0);
 
-  // お手本動画の読み込み処理
+  // お手本動画の読み込み処理（0秒即時ロード）
   const handleModelFile = async (file: File) => {
     setIsProcessingModel(true);
     setModelProgress(null);
     try {
       const seq = await processVideoFile(file, {
-        fps: 15,
+        fps: 20,
         onInitialized: (initialSeq) => {
           setModelSequence(initialSeq); // ドロップした瞬間に即座にプレビュー表示！
         },
         onProgress: setModelProgress,
       });
       setModelSequence(seq);
-      // もし自撮り動画がすでに存在していれば評価を更新
-      if (userSequence && userSequence.frames.length > 0) {
-        const report = evaluateDanceSubmission(seq, userSequence);
-        setEvaluationReport(report);
-      }
     } catch (err) {
       console.error('Model analysis failed:', err);
     } finally {
@@ -49,24 +44,19 @@ export function App() {
     }
   };
 
-  // 提出動画（自撮りダンス）の読み込み処理
+  // 提出動画（自撮りダンス）の読み込み処理（0秒即時ロード）
   const handleUserFile = async (file: File) => {
     setIsProcessingUser(true);
     setUserProgress(null);
     try {
       const seq = await processVideoFile(file, {
-        fps: 15,
+        fps: 20,
         onInitialized: (initialSeq) => {
           setUserSequence(initialSeq); // ドロップした瞬間に即座にプレビュー表示！
         },
         onProgress: setUserProgress,
       });
       setUserSequence(seq);
-      // お手本動画がすでに存在していれば即座に評価を算出
-      if (modelSequence && modelSequence.frames.length > 0) {
-        const report = evaluateDanceSubmission(modelSequence, seq);
-        setEvaluationReport(report);
-      }
     } catch (err) {
       console.error('User submission analysis failed:', err);
     } finally {
@@ -75,12 +65,26 @@ export function App() {
     }
   };
 
-  // 評価実行
+  // 評価実行（比較画面へ遷移）
   const startEvaluation = () => {
     if (!modelSequence || !userSequence) return;
     const report = evaluateDanceSubmission(modelSequence, userSequence);
     setEvaluationReport(report);
     setCurrentTime(0);
+  };
+
+  // 再生時刻更新時のリアルタイムスコア追従
+  const handleTimeUpdate = (time: number) => {
+    setCurrentTime(time);
+    if (
+      modelSequence &&
+      userSequence &&
+      modelSequence.frames.length >= 2 &&
+      userSequence.frames.length >= 2
+    ) {
+      const report = evaluateDanceSubmission(modelSequence, userSequence);
+      setEvaluationReport(report);
+    }
   };
 
   // リセット（新規提出）
@@ -149,28 +153,20 @@ export function App() {
             />
           </div>
 
-          {/* 評価開始ボタン */}
+          {/* 評価開始ボタン（2つの動画がセットされたら即座に実行可能） */}
           {modelSequence && userSequence && (
             <button
               onClick={startEvaluation}
-              disabled={
-                isProcessingModel ||
-                isProcessingUser ||
-                modelSequence.frames.length === 0 ||
-                userSequence.frames.length === 0
-              }
+              disabled={isProcessingModel || isProcessingUser}
               className={`px-8 py-4 rounded-full flex items-center gap-3 font-bold text-xs tracking-widest uppercase transition active:scale-95 shadow-2xl ${
-                isProcessingModel ||
-                isProcessingUser ||
-                modelSequence.frames.length === 0 ||
-                userSequence.frames.length === 0
-                  ? 'bg-zinc-850 text-zinc-500 cursor-not-allowed opacity-70'
+                isProcessingModel || isProcessingUser
+                  ? 'bg-zinc-800 text-zinc-500 cursor-not-allowed opacity-70'
                   : 'bg-white text-zinc-950 hover:bg-zinc-100 cursor-pointer animate-pulse'
               }`}
             >
               <span>
                 {isProcessingModel || isProcessingUser
-                  ? 'EXTRACTING SKELETON...'
+                  ? 'PREPARING VIDEOS...'
                   : 'EVALUATE DANCE'}
               </span>
               <ArrowRight className="w-4 h-4" />
@@ -186,7 +182,7 @@ export function App() {
               modelSeq={modelSequence}
               userSeq={userSequence}
               currentTime={currentTime}
-              onTimeUpdate={setCurrentTime}
+              onTimeUpdate={handleTimeUpdate}
               activeDiscrepancies={getActiveDiscrepancies()}
             />
           )}

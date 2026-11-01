@@ -41,6 +41,8 @@ export interface DanceSequence {
   createdAt: number;
   videoBlob?: Blob; // IndexedDB永続化用の動画バイナリ
   videoUrl?: string; // 再生用Blob URL（実行時生成）
+  width?: number; // 動画の元幅
+  height?: number; // 動画の元高さ
   frames: PoseFrameData[];
 }
 

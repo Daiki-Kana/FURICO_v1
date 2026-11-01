@@ -115,15 +115,33 @@ export function getInterpolatedFrame(
 export function findClosestFrame(
   frames: PoseFrameData[],
   currentTime: number
-): { landmarks: NormalizedLandmark[]; angles: JointAngles } | null {
+): { landmarks: NormalizedLandmark[]; angles: JointAngles; timestamp: number } | null {
   if (!frames || frames.length === 0) return null;
-  if (frames.length === 1) return { landmarks: frames[0].landmarks, angles: frames[0].angles };
+  if (frames.length === 1) {
+    return {
+      landmarks: frames[0].landmarks,
+      angles: frames[0].angles,
+      timestamp: frames[0].timestamp,
+    };
+  }
 
   const first = frames[0];
   const last = frames[frames.length - 1];
 
-  if (currentTime <= first.timestamp) return { landmarks: first.landmarks, angles: first.angles };
-  if (currentTime >= last.timestamp) return { landmarks: last.landmarks, angles: last.angles };
+  if (currentTime <= first.timestamp) {
+    return {
+      landmarks: first.landmarks,
+      angles: first.angles,
+      timestamp: first.timestamp,
+    };
+  }
+  if (currentTime >= last.timestamp) {
+    return {
+      landmarks: last.landmarks,
+      angles: last.angles,
+      timestamp: last.timestamp,
+    };
+  }
 
   let low = 0;
   let high = frames.length - 1;
@@ -131,7 +149,11 @@ export function findClosestFrame(
   while (low <= high) {
     const mid = Math.floor((low + high) / 2);
     if (frames[mid].timestamp === currentTime) {
-      return { landmarks: frames[mid].landmarks, angles: frames[mid].angles };
+      return {
+        landmarks: frames[mid].landmarks,
+        angles: frames[mid].angles,
+        timestamp: frames[mid].timestamp,
+      };
     }
     if (frames[mid].timestamp < currentTime) {
       low = mid + 1;
@@ -148,6 +170,10 @@ export function findClosestFrame(
   const diffB = Math.abs(frames[idxB].timestamp - currentTime);
 
   const best = diffA <= diffB ? frames[idxA] : frames[idxB];
-  return { landmarks: best.landmarks, angles: best.angles };
+  return {
+    landmarks: best.landmarks,
+    angles: best.angles,
+    timestamp: best.timestamp,
+  };
 }
 

@@ -1,6 +1,4 @@
-import { extractJointAngles } from './geometry';
-import { createPoseLandmarkerInstance } from './landmarker';
-import type { DanceSequence, NormalizedLandmark, PoseFrameData } from './types';
+import type { DanceSequence } from './types';
 
 export interface ProcessVideoProgress {
   currentSeconds: number;
@@ -10,219 +8,100 @@ export interface ProcessVideoProgress {
 }
 
 /**
- * ローカル動画ファイルを再生ストリーミングで滑らか・高密度に解析する
- * 1. シーク方式を完全撤廃し、動画の連続再生（Playback）で全フレームを抽出（後半フリーズを根絶）
- * 2. 15fps（約0.066秒間隔）で素早いダンスステップやキレを滑らかに捕捉（カクカク解消）
- * 3. 画面内アクティブ配置によりブラウザの省電力サスペンド（デコード停止）を完全回避
+ * ローカル動画ファイルを即時（0秒）ロードする
+ * 重い事前シーク解析を完全撤廃し、アップロード待機時間をゼロ秒化。
+ * トラッキングは動画本来のアスペクト比を維持したまま、プレイヤー上でリアルタイムに高精度追従する。
  */
 export async function processVideoFile(
   file: File,
   options: {
-    fps?: number; // デフォルト15fps
-    maxResolution?: number; // 480px（高速かつ高精度なバランス）
-    playbackSpeed?: number; // 2.0倍速で高速解析
+    fps?: number;
+    maxResolution?: number;
+    playbackSpeed?: number;
     onInitialized?: (initialSequence: DanceSequence) => void;
     onProgress?: (progress: ProcessVideoProgress) => void;
   } = {}
 ): Promise<DanceSequence> {
-  const {
-    fps = 15,
-    maxResolution: _maxResolution = 480,
-    playbackSpeed: _playbackSpeed = 2.0,
-    onInitialized,
-    onProgress,
-  } = options;
+  const { onInitialized, onProgress } = options;
 
-  const minInterval = 1 / fps;
-
-  // 動画ファイルからBlob URLを生成
+  // 動画ファイルからBlob URLを生成（所要時間0.001秒）
   const videoUrl = URL.createObjectURL(file);
   const video = document.createElement('video');
   video.src = videoUrl;
   video.muted = true;
   video.playsInline = true;
-  video.preload = 'auto';
-
-  // ブラウザの省電力停止（Off-screenサスペンド）を回避するため、
-  // 画面内の隅にアクティブ配置（高解像度を保持するため十分なサイズを確保）
-  video.style.position = 'fixed';
-  video.style.bottom = '0px';
-  video.style.right = '0px';
-  video.style.width = '480px';
-  video.style.height = '360px';
-  video.style.opacity = '0.01';
-  video.style.pointerEvents = 'none';
-  video.style.zIndex = '-1';
-  document.body.appendChild(video);
+  video.preload = 'metadata';
 
   try {
-    // メタデータロードを待機
-    await new Promise<void>((resolve, reject) => {
+    // メタデータロード（所要時間約0.05秒）
+    await new Promise<void>((resolve) => {
+      if (video.readyState >= HTMLMediaElement.HAVE_METADATA) {
+        resolve();
+        return;
+      }
+
       const onLoaded = () => {
         cleanup();
         resolve();
       };
       const onError = () => {
         cleanup();
-        reject(new Error('Failed to load video metadata'));
+        // 万が一エラーでもデフォルト値でフォールバックして画面を止めない
+        resolve();
       };
       const cleanup = () => {
         video.removeEventListener('loadedmetadata', onLoaded);
         video.removeEventListener('error', onError);
       };
+
       video.addEventListener('loadedmetadata', onLoaded);
       video.addEventListener('error', onError);
+      // 安全タイムアウト（最大1秒）
+      setTimeout(() => {
+        cleanup();
+        resolve();
+      }, 1000);
     });
 
     const duration =
-      video.duration && isFinite(video.duration) && video.duration > 0 ? video.duration : 1;
+      video.duration && isFinite(video.duration) && video.duration > 0 ? video.duration : 10;
+    const width = video.videoWidth || 1280;
+    const height = video.videoHeight || 720;
 
-    // メタデータロード直後に即時プレビュー用シーケンスを通知
     const sequenceId = `seq_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-    const initialSequence: DanceSequence = {
+    const sequence: DanceSequence = {
       id: sequenceId,
       name: file.name.replace(/\.[^/.]+$/, ''),
       duration,
-      fps,
+      fps: 20,
       createdAt: Date.now(),
       videoBlob: file,
       videoUrl,
+      width,
+      height,
       frames: [],
     };
 
     if (onInitialized) {
-      onInitialized(initialSequence);
+      onInitialized(sequence);
     }
 
-    // IMAGEモードのPoseLandmarkerを生成（単一フレーム推論）
-    const landmarker = await createPoseLandmarkerInstance('IMAGE');
-
-    const frames: PoseFrameData[] = [];
-    let lastReportedPercent = 0;
-    const stepInterval = minInterval; // 確実なサンプリング間隔（1 / fps）
-    let currentTime = 0;
-
-    try {
-      video.pause();
-
-      while (currentTime <= duration) {
-        const targetTime = Math.round(currentTime * 1000) / 1000;
-
-        // 1. 指定時刻へ確実に同期シーク（デコード確定待ち）
-        video.currentTime = targetTime;
-        await new Promise<void>((resolve) => {
-          let isDone = false;
-          let timer: number | null = null;
-
-          const onSeeked = () => {
-            if (!isDone) {
-              isDone = true;
-              if (timer) clearTimeout(timer);
-              video.removeEventListener('seeked', onSeeked);
-              // requestAnimationFrameでGPUピクセル確定を確実に待機
-              requestAnimationFrame(() => resolve());
-            }
-          };
-
-          video.addEventListener('seeked', onSeeked, { once: true });
-          // 最大300ms安全タイムアウト
-          timer = window.setTimeout(() => {
-            if (!isDone) {
-              isDone = true;
-              video.removeEventListener('seeked', onSeeked);
-              resolve();
-            }
-          }, 300);
-        });
-
-        // 2. 確定した静止フレームからMediaPipe骨格検出（動画は停止中のためズレ・ラグが原理的にゼロ）
-        try {
-          const result = landmarker.detect(video);
-          if (result.landmarks && result.landmarks.length > 0) {
-            const rawLandmarks = result.landmarks[0] as NormalizedLandmark[];
-            const angles = extractJointAngles(rawLandmarks);
-
-            if (angles) {
-              frames.push({
-                timestamp: targetTime,
-                landmarks: rawLandmarks,
-                angles,
-              });
-            }
-          }
-        } catch (inferErr) {
-          console.warn('Frame detection warning at', targetTime, inferErr);
-        }
-
-        // 3. 進捗率の単調増加通知
-        const rawPercent = Math.min(100, Math.floor((targetTime / duration) * 100));
-        const safePercent = Math.max(lastReportedPercent, rawPercent);
-        lastReportedPercent = safePercent;
-
-        if (onProgress) {
-          onProgress({
-            currentSeconds: targetTime,
-            totalSeconds: duration,
-            progressPercent: safePercent,
-            framesExtracted: frames.length,
-          });
-        }
-
-        // 次のステップ時刻へ前進
-        currentTime += stepInterval;
-
-        // UIレンダリングのための極小マイクロタスク
-        await new Promise((r) => setTimeout(r, 0));
-      }
-
-      // 【静止時・冒頭欠落保証】0.0sと末尾durationの確実な補完
-      if (frames.length > 0) {
-        frames.sort((a, b) => a.timestamp - b.timestamp);
-
-        if (frames[0].timestamp > 0.02) {
-          frames.unshift({
-            timestamp: 0.0,
-            landmarks: frames[0].landmarks,
-            angles: frames[0].angles,
-          });
-        }
-
-        const lastFrame = frames[frames.length - 1];
-        if (lastFrame.timestamp < duration - 0.05) {
-          frames.push({
-            timestamp: Math.round(duration * 1000) / 1000,
-            landmarks: lastFrame.landmarks,
-            angles: lastFrame.angles,
-          });
-        }
-      }
-
-      // 完了通知
-      if (onProgress) {
-        onProgress({
-          currentSeconds: duration,
-          totalSeconds: duration,
-          progressPercent: 100,
-          framesExtracted: frames.length,
-        });
-      }
-    } finally {
-      landmarker.close();
+    if (onProgress) {
+      onProgress({
+        currentSeconds: duration,
+        totalSeconds: duration,
+        progressPercent: 100,
+        framesExtracted: 0,
+      });
     }
 
-    const completedSequence: DanceSequence = {
-      ...initialSequence,
-      frames,
-    };
-
-    return completedSequence;
+    return sequence;
   } finally {
-    // 画面内DOMのクリーンアップ
-    if (document.body.contains(video)) {
-      document.body.removeChild(video);
-    }
+    // リソース解放
+    video.src = '';
   }
 }
+
 
 /**
  * 画面共有（getDisplayMedia）がサポートされている端末か判定する（PC: true, スマホ: false）

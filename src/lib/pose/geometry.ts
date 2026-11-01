@@ -55,6 +55,17 @@ export function calculateAngle(
   return (angleRad * 180) / Math.PI;
 }
 
+export const DEFAULT_JOINT_ANGLES: JointAngles = {
+  leftElbow: 180,
+  rightElbow: 180,
+  leftShoulder: 0,
+  rightShoulder: 0,
+  leftHip: 180,
+  rightHip: 180,
+  leftKnee: 180,
+  rightKnee: 180,
+};
+
 /**
  * 33点のランドマーク配列から、指定された主要8関節の角度をすべて算出する
  */
