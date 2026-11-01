@@ -35,8 +35,8 @@ export interface VideoEvaluationReport {
 export function evaluateDanceSubmission(
   modelSeq: DanceSequence,
   userSeq: DanceSequence,
-  windowSeconds = 0.4,
-  thresholdAngle = 20
+  windowSeconds = 0.6,
+  thresholdAngle = 40
 ): VideoEvaluationReport {
   const userFrames = userSeq.frames;
   const modelFrames = modelSeq.frames;
@@ -71,7 +71,7 @@ export function evaluateDanceSubmission(
 
   for (const uFrame of userFrames) {
     const t = uFrame.timestamp;
-    // お手本フレームから近傍のベストマッチを探索
+    // お手本フレームから近傍のベストマッチを探索（±0.6秒で音ハメの微差を吸収）
     const minTime = t - windowSeconds;
     const maxTime = t + windowSeconds;
 
@@ -118,6 +118,7 @@ export function evaluateDanceSubmission(
         frameWorstJoint = j;
       }
 
+      // 明らかなフォームの違い（40度以上）のみを課題として抽出
       if (delta >= thresholdAngle) {
         allIssues.push({
           timestamp: Math.round(t * 10) / 10,
@@ -136,14 +137,14 @@ export function evaluateDanceSubmission(
 
     timelineErrors.push({
       timestamp: Math.round(t * 10) / 10,
-      error: Math.min(1.0, frameMeanErr / 40), // 40度ズレでエラー度1.0
+      error: Math.min(1.0, frameMeanErr / 60), // 60度ズレでエラー度1.0
       worstJoint: frameWorstJoint,
     });
   }
 
-  // 総合スコア（平均誤差0度で100点、40度で0点）
-  const avgError = totalFramesCompared > 0 ? totalMeanError / totalFramesCompared : 40;
-  const overallScore = Math.max(0, Math.min(100, Math.round(100 - (avgError / 40) * 100)));
+  // 総合スコア（平均誤差0度で100点、60度で0点、20度前後で75〜85点の実践的設計）
+  const avgError = totalFramesCompared > 0 ? totalMeanError / totalFramesCompared : 60;
+  const overallScore = Math.max(0, Math.min(100, Math.round(100 - (avgError / 60) * 100)));
 
   // 部位別スコア
   const calcGroupScore = (joints: JointName[]) => {
@@ -151,8 +152,8 @@ export function evaluateDanceSubmission(
     for (const j of joints) {
       sum += jointErrorSums[j];
     }
-    const groupAvg = totalFramesCompared > 0 ? sum / (joints.length * totalFramesCompared) : 40;
-    return Math.max(0, Math.min(100, Math.round(100 - (groupAvg / 40) * 100)));
+    const groupAvg = totalFramesCompared > 0 ? sum / (joints.length * totalFramesCompared) : 60;
+    return Math.max(0, Math.min(100, Math.round(100 - (groupAvg / 60) * 100)));
   };
 
   const jointScores = {

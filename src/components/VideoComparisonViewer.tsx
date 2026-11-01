@@ -157,7 +157,7 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
                 const ua = userFrameData.angles;
                 const liveDiscrepant: JointName[] = [];
                 const checkJoint = (j: JointName) => {
-                  if (Math.abs(ma[j] - ua[j]) > 30) {
+                  if (Math.abs(ma[j] - ua[j]) > 42) {
                     liveDiscrepant.push(j);
                   }
                 };

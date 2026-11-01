@@ -52,8 +52,8 @@ export function calculateMeanAngularError(anglesA: JointAngles, anglesB: JointAn
 }
 
 export interface SlidingWindowOptions {
-  windowSeconds?: number; // 前後の検索ウィンドウ幅（秒、デフォルト ±0.5秒）
-  angleThreshold?: number; // ズレと判定する角度閾値（度、デフォルト 20度）
+  windowSeconds?: number; // 前後の検索ウィンドウ幅（秒、デフォルト ±0.6秒）
+  angleThreshold?: number; // ズレと判定する角度閾値（度、デフォルト 40度）
 }
 
 /**
@@ -70,7 +70,7 @@ export function compareWithSlidingWindow(
     return null;
   }
 
-  const { windowSeconds = 0.5, angleThreshold = 20 } = options;
+  const { windowSeconds = 0.6, angleThreshold = 40 } = options;
 
   const minTime = videoCurrentTime - windowSeconds;
   const maxTime = videoCurrentTime + windowSeconds;
@@ -141,8 +141,8 @@ export function compareWithSlidingWindow(
   }
 
   // 4. 一致度スコアの計算（0〜100）
-  // 平均誤差が0度なら100点、45度以上で0点
-  const score = Math.max(0, Math.min(100, Math.round(100 - (minError / 45) * 100)));
+  // 平均誤差が0度なら100点、60度以上で0点
+  const score = Math.max(0, Math.min(100, Math.round(100 - (minError / 60) * 100)));
 
   return {
     matchedTimestamp: bestFrame.timestamp,
