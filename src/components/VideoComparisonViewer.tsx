@@ -64,10 +64,9 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
   );
 
   const landmarkerRef = useRef<any>(null);
-  const isInferringModelRef = useRef<boolean>(false);
-  const isInferringUserRef = useRef<boolean>(false);
-  const lastInferModelTimeRef = useRef<number>(0);
-  const lastInferUserTimeRef = useRef<number>(0);
+  const isInferringRef = useRef<boolean>(false);
+  const lastInferTimeRef = useRef<number>(0);
+  const inferTargetRef = useRef<'model' | 'user'>('model');
 
   const latestModelLandmarksRef = useRef<NormalizedLandmark[] | null>(null);
   const latestUserLandmarksRef = useRef<NormalizedLandmark[] | null>(null);
@@ -111,22 +110,30 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
     }
   }, [isPlaying, playbackRate]);
 
-  // 外部からのcurrentTime変更（シークバー操作等）に同期
+  // 【重要: 再生中のシークフリーズを完全根絶】
+  // 一時停止中（シークバー操作など）のみ video.currentTime を更新する
   useEffect(() => {
+    if (isPlaying) return; // 再生中は動画自身の再生クロックに任せる！強制シークは絶対に禁止
     const mv = modelVideoRef.current;
     const uv = userVideoRef.current;
-    if (mv && Math.abs(mv.currentTime - currentTime) > 0.05) {
+    if (mv && Math.abs(mv.currentTime - currentTime) > 0.08) {
       mv.currentTime = Math.min(currentTime, mv.duration || currentTime);
     }
-    if (uv && Math.abs(uv.currentTime - currentTime) > 0.05) {
+    if (uv && Math.abs(uv.currentTime - currentTime) > 0.08) {
       uv.currentTime = Math.min(currentTime, uv.duration || currentTime);
     }
-  }, [currentTime]);
+  }, [currentTime, isPlaying]);
 
-  // シークバー操作
+  // 手動シーク操作
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
     const time = Number(e.target.value);
     onTimeUpdate(time);
+    if (modelVideoRef.current) {
+      modelVideoRef.current.currentTime = Math.min(time, modelVideoRef.current.duration || time);
+    }
+    if (userVideoRef.current) {
+      userVideoRef.current.currentTime = Math.min(time, userVideoRef.current.duration || time);
+    }
   };
 
   // 速度変更
@@ -143,7 +150,7 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
     if (userVideoRef.current) userVideoRef.current.currentTime = 0;
   };
 
-  // 【同期描画ループ（60fps描画 & 20fpsリアルタイム推論 & アスペクト比完全吸着）】
+  // 【超軽量・高精度 同期描画ループ（交互推論・ドリフト自動調停・完全吸着）】
   const lastStateUpdateTimeRef = useRef<number>(0);
 
   useEffect(() => {
@@ -157,15 +164,20 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
 
       const now = performance.now();
 
-      // 再生時刻の同期更新（100msスロットリングでReact負荷を90%削減）
+      // 再生時刻の同期更新（100msスロットリング）
       if (mv && isPlaying) {
         if (now - lastStateUpdateTimeRef.current > 100) {
           lastStateUpdateTimeRef.current = now;
           onTimeUpdate(mv.currentTime);
+
+          // 2つの動画の再生位置が 0.35秒以上ズレた場合のみ、微小補正（カクつき防止）
+          if (uv && Math.abs(mv.currentTime - uv.currentTime) > 0.35) {
+            uv.currentTime = mv.currentTime;
+          }
         }
       }
 
-      // 1. お手本動画の解像度同期 & 骨格追従
+      // 1. お手本動画の解像度同期
       if (mv && mc && mv.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
         if (mv.videoWidth > 0 && mv.videoHeight > 0) {
           if (mc.width !== mv.videoWidth || mc.height !== mv.videoHeight) {
@@ -175,53 +187,18 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
           }
         }
 
+        const mt = mv.currentTime;
+        const cachedModel = findClosestFrame(modelSeq.frames, mt);
+        if (cachedModel && Math.abs(cachedModel.timestamp - mt) <= 0.06) {
+          latestModelLandmarksRef.current = cachedModel.landmarks;
+          latestModelAnglesRef.current = cachedModel.angles;
+        }
+
         const mctx = mc.getContext('2d');
         if (mctx && mc.width > 0 && mc.height > 0) {
           mctx.clearRect(0, 0, mc.width, mc.height);
-
-          const mt = mv.currentTime;
-          const cachedModel = findClosestFrame(modelSeq.frames, mt);
-          let modelLandmarks: NormalizedLandmark[] | null = null;
-
-          if (cachedModel && Math.abs(cachedModel.timestamp - mt) <= 0.06) {
-            modelLandmarks = cachedModel.landmarks;
-            latestModelLandmarksRef.current = cachedModel.landmarks;
-            latestModelAnglesRef.current = cachedModel.angles;
-          } else {
-            // キャッシュ未検出時はリアルタイム推論（20fps）
-            if (
-              landmarkerRef.current &&
-              !isInferringModelRef.current &&
-              now - lastInferModelTimeRef.current >= 45
-            ) {
-              isInferringModelRef.current = true;
-              try {
-                const res = landmarkerRef.current.detect(mv);
-                if (res.landmarks && res.landmarks.length > 0) {
-                  const lms = res.landmarks[0];
-                  latestModelLandmarksRef.current = lms;
-                  modelLandmarks = lms;
-                  const angles = extractJointAngles(lms) || DEFAULT_JOINT_ANGLES;
-                  latestModelAnglesRef.current = angles;
-                  insertFrameSorted(modelSeq.frames, {
-                    timestamp: mt,
-                    landmarks: lms,
-                    angles,
-                  });
-                }
-              } catch (_) {
-              } finally {
-                isInferringModelRef.current = false;
-                lastInferModelTimeRef.current = performance.now();
-              }
-            }
-            if (!modelLandmarks && latestModelLandmarksRef.current) {
-              modelLandmarks = latestModelLandmarksRef.current;
-            }
-          }
-
-          if (modelLandmarks) {
-            drawPoseOnCanvas(mctx, modelLandmarks, {
+          if (latestModelLandmarksRef.current) {
+            drawPoseOnCanvas(mctx, latestModelLandmarksRef.current, {
               mirror: false,
               glowEffect: true,
             });
@@ -229,7 +206,7 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
         }
       }
 
-      // 2. 提出動画の解像度同期 & 骨格追従 & リアルタイムズレ検知
+      // 2. 提出動画の解像度同期 & リアルタイム比較描画
       if (uv && uc && uv.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
         if (uv.videoWidth > 0 && uv.videoHeight > 0) {
           if (uc.width !== uv.videoWidth || uc.height !== uv.videoHeight) {
@@ -239,52 +216,18 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
           }
         }
 
+        const ut = uv.currentTime;
+        const cachedUser = findClosestFrame(userSeq.frames, ut);
+        if (cachedUser && Math.abs(cachedUser.timestamp - ut) <= 0.06) {
+          latestUserLandmarksRef.current = cachedUser.landmarks;
+          latestUserAnglesRef.current = cachedUser.angles;
+        }
+
         const uctx = uc.getContext('2d');
         if (uctx && uc.width > 0 && uc.height > 0) {
           uctx.clearRect(0, 0, uc.width, uc.height);
 
-          const ut = uv.currentTime;
-          const cachedUser = findClosestFrame(userSeq.frames, ut);
-          let userLandmarks: NormalizedLandmark[] | null = null;
-
-          if (cachedUser && Math.abs(cachedUser.timestamp - ut) <= 0.06) {
-            userLandmarks = cachedUser.landmarks;
-            latestUserLandmarksRef.current = cachedUser.landmarks;
-            latestUserAnglesRef.current = cachedUser.angles;
-          } else {
-            // キャッシュ未検出時はリアルタイム推論（20fps）
-            if (
-              landmarkerRef.current &&
-              !isInferringUserRef.current &&
-              now - lastInferUserTimeRef.current >= 45
-            ) {
-              isInferringUserRef.current = true;
-              try {
-                const res = landmarkerRef.current.detect(uv);
-                if (res.landmarks && res.landmarks.length > 0) {
-                  const lms = res.landmarks[0];
-                  latestUserLandmarksRef.current = lms;
-                  userLandmarks = lms;
-                  const angles = extractJointAngles(lms) || DEFAULT_JOINT_ANGLES;
-                  latestUserAnglesRef.current = angles;
-                  insertFrameSorted(userSeq.frames, {
-                    timestamp: ut,
-                    landmarks: lms,
-                    angles,
-                  });
-                }
-              } catch (_) {
-              } finally {
-                isInferringUserRef.current = false;
-                lastInferUserTimeRef.current = performance.now();
-              }
-            }
-            if (!userLandmarks && latestUserLandmarksRef.current) {
-              userLandmarks = latestUserLandmarksRef.current;
-            }
-          }
-
-          if (userLandmarks) {
+          if (latestUserLandmarksRef.current) {
             // お手本と提出動画の角度をリアルタイム比較（40度以上の明確なズレのみ赤発光）
             let currentDiscrepancies = [...activeDiscrepancies];
             const ma = latestModelAnglesRef.current;
@@ -308,11 +251,71 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
               currentDiscrepancies = Array.from(new Set([...currentDiscrepancies, ...liveDiscrepant]));
             }
 
-            drawPoseOnCanvas(uctx, userLandmarks, {
+            drawPoseOnCanvas(uctx, latestUserLandmarksRef.current, {
               mirror: mirrorUser,
               activeDiscrepancies: currentDiscrepancies,
               glowEffect: true,
             });
+          }
+        }
+      }
+
+      // 3. 【推論の交互インターリーブ実行】メインスレッド負荷を半減させ、動画フリーズを根絶！
+      if (
+        landmarkerRef.current &&
+        !isInferringRef.current &&
+        now - lastInferTimeRef.current >= 35
+      ) {
+        const target = inferTargetRef.current;
+        inferTargetRef.current = target === 'model' ? 'user' : 'model'; // 次回は相手を推論
+
+        if (target === 'model' && mv && mv.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+          const mt = mv.currentTime;
+          const cached = findClosestFrame(modelSeq.frames, mt);
+          if (!cached || Math.abs(cached.timestamp - mt) > 0.06) {
+            isInferringRef.current = true;
+            try {
+              const res = landmarkerRef.current.detect(mv);
+              if (res.landmarks && res.landmarks.length > 0) {
+                const lms = res.landmarks[0];
+                latestModelLandmarksRef.current = lms;
+                const angles = extractJointAngles(lms) || DEFAULT_JOINT_ANGLES;
+                latestModelAnglesRef.current = angles;
+                insertFrameSorted(modelSeq.frames, {
+                  timestamp: mt,
+                  landmarks: lms,
+                  angles,
+                });
+              }
+            } catch (_) {
+            } finally {
+              isInferringRef.current = false;
+              lastInferTimeRef.current = performance.now();
+            }
+          }
+        } else if (target === 'user' && uv && uv.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+          const ut = uv.currentTime;
+          const cached = findClosestFrame(userSeq.frames, ut);
+          if (!cached || Math.abs(cached.timestamp - ut) > 0.06) {
+            isInferringRef.current = true;
+            try {
+              const res = landmarkerRef.current.detect(uv);
+              if (res.landmarks && res.landmarks.length > 0) {
+                const lms = res.landmarks[0];
+                latestUserLandmarksRef.current = lms;
+                const angles = extractJointAngles(lms) || DEFAULT_JOINT_ANGLES;
+                latestUserAnglesRef.current = angles;
+                insertFrameSorted(userSeq.frames, {
+                  timestamp: ut,
+                  landmarks: lms,
+                  angles,
+                });
+              }
+            } catch (_) {
+            } finally {
+              isInferringRef.current = false;
+              lastInferTimeRef.current = performance.now();
+            }
           }
         }
       }
@@ -476,6 +479,8 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
           onClick={() => {
             const next = Math.min(maxDuration, currentTime + 0.1);
             onTimeUpdate(next);
+            if (modelVideoRef.current) modelVideoRef.current.currentTime = next;
+            if (userVideoRef.current) userVideoRef.current.currentTime = next;
           }}
           className="p-2.5 rounded-full bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300 hover:text-white transition active:scale-95 cursor-pointer shrink-0"
           title="Step Forward"

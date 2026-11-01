@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { ArrowRight, RotateCcw } from 'lucide-react';
 import { ScoreReport } from './components/ScoreReport';
 import { VideoComparisonViewer } from './components/VideoComparisonViewer';
@@ -22,6 +22,7 @@ export function App() {
   // 評価レポートと再生時刻
   const [evaluationReport, setEvaluationReport] = useState<VideoEvaluationReport | null>(null);
   const [currentTime, setCurrentTime] = useState<number>(0);
+  const lastReportCalcTimeRef = useRef<number>(0);
 
   // お手本動画の読み込み処理（0秒即時ロード）
   const handleModelFile = async (file: File) => {
@@ -73,15 +74,18 @@ export function App() {
     setCurrentTime(0);
   };
 
-  // 再生時刻更新時のリアルタイムスコア追従
+  // 再生時刻更新時のリアルタイムスコア追従（1.5秒スロットリングで過負荷フリーズ防止）
   const handleTimeUpdate = (time: number) => {
     setCurrentTime(time);
+    const now = performance.now();
     if (
+      now - lastReportCalcTimeRef.current > 1500 &&
       modelSequence &&
       userSequence &&
       modelSequence.frames.length >= 2 &&
       userSequence.frames.length >= 2
     ) {
+      lastReportCalcTimeRef.current = now;
       const report = evaluateDanceSubmission(modelSequence, userSequence);
       setEvaluationReport(report);
     }
