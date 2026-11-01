@@ -58,3 +58,16 @@ export async function createPoseLandmarkerInstance(
     return landmarker;
   }
 }
+
+let sharedLandmarkerPromise: Promise<PoseLandmarker> | null = null;
+
+/**
+ * 共有のPoseLandmarker（IMAGEモード）インスタンスを取得する
+ * 毎フレーム独立推論のため、シークや複数動画の同時推論でも状態競合が起きず極めて安定
+ */
+export async function getSharedPoseLandmarker(): Promise<PoseLandmarker> {
+  if (!sharedLandmarkerPromise) {
+    sharedLandmarkerPromise = createPoseLandmarkerInstance('IMAGE');
+  }
+  return sharedLandmarkerPromise;
+}

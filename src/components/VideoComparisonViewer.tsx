@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { FastForward, FlipHorizontal, Pause, Play, RotateCcw } from 'lucide-react';
-import { getInterpolatedFrame } from '../lib/pose/interpolator';
+import { getSharedPoseLandmarker } from '../lib/pose/landmarker';
 import { drawPoseOnCanvas } from '../lib/pose/renderer';
-import type { DanceSequence, JointName } from '../lib/pose/types';
+import type { DanceSequence, JointName, NormalizedLandmark } from '../lib/pose/types';
+import { extractJointAngles } from '../lib/pose/geometry';
 
 interface VideoComparisonViewerProps {
   modelSeq: DanceSequence;
@@ -84,95 +85,139 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
     if (userVideoRef.current) userVideoRef.current.currentTime = 0;
   };
 
-  // 【重要】線形補間（Lerp）によるヌルヌル追従の骨格描画
-  const renderFrames = () => {
-    const mv = modelVideoRef.current;
-    const uv = userVideoRef.current;
-    const mc = modelCanvasRef.current;
-    const uc = userCanvasRef.current;
-
-    // 1. お手本動画の骨格描画（線形補間により60fps滑らか追従）
-    if (mc && mv) {
-      if (mv.videoWidth > 0 && mv.videoHeight > 0) {
-        if (mc.width !== mv.videoWidth || mc.height !== mv.videoHeight) {
-          mc.width = mv.videoWidth;
-          mc.height = mv.videoHeight;
-        }
-      }
-      if (mc.width > 0 && mc.height > 0) {
-        const mctx = mc.getContext('2d');
-        if (mctx) {
-          mctx.clearRect(0, 0, mc.width, mc.height);
-          // 線形補間（Lerp）で現在時刻の滑らかな骨格座標を算出
-          const interpolatedModel = getInterpolatedFrame(modelSeq.frames, mv.currentTime);
-          if (interpolatedModel) {
-            drawPoseOnCanvas(mctx, interpolatedModel.landmarks, {
-              mirror: false,
-              glowEffect: true,
-            });
-          }
-        }
-      }
-    }
-
-    // 2. 提出動画の骨格描画（線形補間 ＋ ズレ部位ハイライト）
-    if (uc && uv) {
-      if (uv.videoWidth > 0 && uv.videoHeight > 0) {
-        if (uc.width !== uv.videoWidth || uc.height !== uv.videoHeight) {
-          uc.width = uv.videoWidth;
-          uc.height = uv.videoHeight;
-        }
-      }
-      if (uc.width > 0 && uc.height > 0) {
-        const uctx = uc.getContext('2d');
-        if (uctx) {
-          uctx.clearRect(0, 0, uc.width, uc.height);
-          // 線形補間（Lerp）で自撮りダンスの動きにヌルヌル吸着
-          const interpolatedUser = getInterpolatedFrame(userSeq.frames, uv.currentTime);
-          if (interpolatedUser) {
-            drawPoseOnCanvas(uctx, interpolatedUser.landmarks, {
-              mirror: mirrorUser,
-              activeDiscrepancies,
-              glowEffect: true,
-            });
-          }
-        }
-      }
-    }
-  };
-
-  // アニメーションループ（常時同期描画）
+  // 【最重要】動画映像からの直接リアルタイム推論ループ（カメラと完全に同一）
   useEffect(() => {
     let animId: number;
+    let isMounted = true;
 
-    const loop = () => {
-      const mv = modelVideoRef.current;
-      const uv = userVideoRef.current;
+    let lastModelLandmarks: NormalizedLandmark[] | null = null;
+    let lastUserLandmarks: NormalizedLandmark[] | null = null;
+    let lastModelInferredTime = -1;
+    let lastUserInferredTime = -1;
 
-      if (mv && uv) {
-        if (isPlaying) {
+    getSharedPoseLandmarker().then((landmarker) => {
+      if (!isMounted) return;
+
+      const loop = () => {
+        if (!isMounted) return;
+
+        const mv = modelVideoRef.current;
+        const uv = userVideoRef.current;
+        const mc = modelCanvasRef.current;
+        const uc = userCanvasRef.current;
+
+        // 再生時刻の同期更新
+        if (mv && isPlaying) {
           onTimeUpdate(mv.currentTime);
-          if (mv.ended || uv.ended) {
+          if (mv.ended || (uv && uv.ended)) {
             setIsPlaying(false);
           }
         }
-      }
 
-      renderFrames();
+        // 1. お手本動画の直接推論＆描画
+        if (mv && mc && mv.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+          if (mv.videoWidth > 0 && mv.videoHeight > 0) {
+            if (mc.width !== mv.videoWidth || mc.height !== mv.videoHeight) {
+              mc.width = mv.videoWidth;
+              mc.height = mv.videoHeight;
+            }
+          }
+
+          const mctx = mc.getContext('2d');
+          if (mctx && mc.width > 0 && mc.height > 0) {
+            mctx.clearRect(0, 0, mc.width, mc.height);
+
+            if (Math.abs(mv.currentTime - lastModelInferredTime) > 0.02 || !isPlaying) {
+              lastModelInferredTime = mv.currentTime;
+              try {
+                const res = landmarker.detect(mv);
+                if (res.landmarks && res.landmarks.length > 0) {
+                  lastModelLandmarks = res.landmarks[0] as NormalizedLandmark[];
+                }
+              } catch (err) {
+                // スキップ
+              }
+            }
+
+            if (lastModelLandmarks) {
+              drawPoseOnCanvas(mctx, lastModelLandmarks, {
+                mirror: false,
+                glowEffect: true,
+              });
+            }
+          }
+        }
+
+        // 2. 提出動画の直接推論＆描画（リアルタイム姿勢比較＆ズレ赤ハイライト）
+        if (uv && uc && uv.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+          if (uv.videoWidth > 0 && uv.videoHeight > 0) {
+            if (uc.width !== uv.videoWidth || uc.height !== uv.videoHeight) {
+              uc.width = uv.videoWidth;
+              uc.height = uv.videoHeight;
+            }
+          }
+
+          const uctx = uc.getContext('2d');
+          if (uctx && uc.width > 0 && uc.height > 0) {
+            uctx.clearRect(0, 0, uc.width, uc.height);
+
+            if (Math.abs(uv.currentTime - lastUserInferredTime) > 0.02 || !isPlaying) {
+              lastUserInferredTime = uv.currentTime;
+              try {
+                const res = landmarker.detect(uv);
+                if (res.landmarks && res.landmarks.length > 0) {
+                  lastUserLandmarks = res.landmarks[0] as NormalizedLandmark[];
+                }
+              } catch (err) {
+                // スキップ
+              }
+            }
+
+            // リアルタイムズレ判定
+            let currentDiscrepancies = [...activeDiscrepancies];
+            if (lastModelLandmarks && lastUserLandmarks) {
+              const modelAngles = extractJointAngles(lastModelLandmarks);
+              const userAngles = extractJointAngles(lastUserLandmarks);
+              if (modelAngles && userAngles) {
+                const liveDiscrepant: JointName[] = [];
+                const checkJoint = (j: JointName) => {
+                  if (Math.abs(modelAngles[j] - userAngles[j]) > 30) {
+                    liveDiscrepant.push(j);
+                  }
+                };
+                checkJoint('leftElbow');
+                checkJoint('rightElbow');
+                checkJoint('leftShoulder');
+                checkJoint('rightShoulder');
+                checkJoint('leftHip');
+                checkJoint('rightHip');
+                checkJoint('leftKnee');
+                checkJoint('rightKnee');
+                currentDiscrepancies = Array.from(new Set([...currentDiscrepancies, ...liveDiscrepant]));
+              }
+            }
+
+            if (lastUserLandmarks) {
+              drawPoseOnCanvas(uctx, lastUserLandmarks, {
+                mirror: mirrorUser,
+                activeDiscrepancies: currentDiscrepancies,
+                glowEffect: true,
+              });
+            }
+          }
+        }
+
+        animId = requestAnimationFrame(loop);
+      };
+
       animId = requestAnimationFrame(loop);
-    };
-
-    animId = requestAnimationFrame(loop);
+    });
 
     return () => {
-      cancelAnimationFrame(animId);
+      isMounted = false;
+      if (animId) cancelAnimationFrame(animId);
     };
-  }, [isPlaying, modelSeq, userSeq, activeDiscrepancies, mirrorUser, onTimeUpdate]);
-
-  // 初回マウント時・シーク時にも即時描画を実行
-  useEffect(() => {
-    renderFrames();
-  }, [currentTime, mirrorUser]);
+  }, [isPlaying, activeDiscrepancies, mirrorUser, onTimeUpdate]);
 
   return (
     <div className="w-full flex flex-col gap-4">
@@ -189,8 +234,6 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
             playsInline
             muted
             className="w-full h-full object-contain"
-            onLoadedData={renderFrames}
-            onSeeked={renderFrames}
           />
           <canvas
             ref={modelCanvasRef}
@@ -224,8 +267,6 @@ export const VideoComparisonViewer: React.FC<VideoComparisonViewerProps> = ({
             playsInline
             muted
             className={`w-full h-full object-contain ${mirrorUser ? 'scale-x-[-1]' : ''}`}
-            onLoadedData={renderFrames}
-            onSeeked={renderFrames}
           />
           <canvas
             ref={userCanvasRef}

@@ -27,7 +27,7 @@ export async function processVideoFile(
 ): Promise<DanceSequence> {
   const {
     fps = 15,
-    maxResolution = 480,
+    maxResolution: _maxResolution = 480,
     playbackSpeed = 2.0,
     onInitialized,
     onProgress,
@@ -44,12 +44,12 @@ export async function processVideoFile(
   video.preload = 'auto';
 
   // ブラウザの省電力停止（Off-screenサスペンド）を回避するため、
-  // 画面内の隅に極小・半透明で配置して「アクティブ描画中」と認識させる
+  // 画面内の隅にアクティブ配置（高解像度を保持するため十分なサイズを確保）
   video.style.position = 'fixed';
-  video.style.bottom = '4px';
-  video.style.right = '4px';
-  video.style.width = '32px';
-  video.style.height = '32px';
+  video.style.bottom = '0px';
+  video.style.right = '0px';
+  video.style.width = '480px';
+  video.style.height = '360px';
   video.style.opacity = '0.01';
   video.style.pointerEvents = 'none';
   video.style.zIndex = '-1';
@@ -76,12 +76,6 @@ export async function processVideoFile(
 
     const duration =
       video.duration && isFinite(video.duration) && video.duration > 0 ? video.duration : 1;
-    const rawW = video.videoWidth || 640;
-    const rawH = video.videoHeight || 480;
-
-    const scale = Math.min(1.0, maxResolution / Math.max(rawW, rawH));
-    const targetW = Math.round(rawW * scale);
-    const targetH = Math.round(rawH * scale);
 
     // メタデータロード直後に即時プレビュー用シーケンスを通知
     const sequenceId = `seq_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
@@ -100,15 +94,6 @@ export async function processVideoFile(
       onInitialized(initialSequence);
     }
 
-    // オフスクリーンCanvas
-    const canvas = document.createElement('canvas');
-    canvas.width = targetW;
-    canvas.height = targetH;
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    if (!ctx) {
-      throw new Error('Failed to get 2D canvas context');
-    }
-
     // IMAGEモードのPoseLandmarkerを生成（単一フレーム推論）
     const landmarker = await createPoseLandmarkerInstance('IMAGE');
 
@@ -116,10 +101,46 @@ export async function processVideoFile(
     let lastExtractedTime = -1;
     let lastReportedPercent = 0;
 
-    // 再生速度を設定（ブラウザが対応していれば2倍速で素早く走査）
-    video.playbackRate = playbackSpeed;
-
     try {
+      // 【最重要】動画再生前に0.0秒の静止フレームを確実にデコード・キャプチャ（video直接推論）
+      try {
+        video.currentTime = 0;
+        await new Promise<void>((resolve) => {
+          if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+            resolve();
+          } else {
+            const onReady = () => {
+              video.removeEventListener('loadeddata', onReady);
+              video.removeEventListener('seeked', onReady);
+              resolve();
+            };
+            video.addEventListener('loadeddata', onReady, { once: true });
+            video.addEventListener('seeked', onReady, { once: true });
+            setTimeout(resolve, 300);
+          }
+        });
+
+        // 0.0秒時点の直接骨格検出
+        const initResult = landmarker.detect(video);
+        if (initResult.landmarks && initResult.landmarks.length > 0) {
+          const rawLandmarks = initResult.landmarks[0] as NormalizedLandmark[];
+          const angles = extractJointAngles(rawLandmarks);
+          if (angles) {
+            frames.push({
+              timestamp: 0,
+              landmarks: rawLandmarks,
+              angles,
+            });
+            lastExtractedTime = 0;
+          }
+        }
+      } catch (initErr) {
+        console.warn('Initial frame (0.0s) capture warning:', initErr);
+      }
+
+      // 再生速度を設定（ブラウザが対応していれば2倍速で素早く走査）
+      video.playbackRate = playbackSpeed;
+
       await new Promise<void>((resolve, reject) => {
         let isCompleted = false;
         let stalledTimer: number | null = null;
@@ -137,16 +158,13 @@ export async function processVideoFile(
 
           const t = video.currentTime;
 
-          // 最低インターバル（例: 0.066秒）ごとにフレームをサンプリング
+          // 最低インターバルごとにフレームをサンプリング
           if (lastExtractedTime < 0 || t - lastExtractedTime >= minInterval || t >= duration - 0.05) {
             lastExtractedTime = t;
 
-            // 1. 最適化Canvasへの描画
-            ctx.drawImage(video, 0, 0, targetW, targetH);
-
-            // 2. MediaPipe骨格検出
+            // MediaPipe骨格検出（videoから直接推論）
             try {
-              const result = landmarker.detect(canvas);
+              const result = landmarker.detect(video);
               if (result.landmarks && result.landmarks.length > 0) {
                 const rawLandmarks = result.landmarks[0] as NormalizedLandmark[];
                 const angles = extractJointAngles(rawLandmarks);
@@ -214,7 +232,7 @@ export async function processVideoFile(
           }
         };
 
-        // 万が一のスタック防止タイマー（duration / playbackSpeed + 5秒）
+        // 万が一のスタック防止タイマー（duration / playbackSpeed + 6秒）
         const maxWaitMs = Math.max(10000, (duration / playbackSpeed) * 1000 + 6000);
         stalledTimer = window.setTimeout(() => {
           console.warn('Playback scan reached timeout safety margin. Finalizing frames.');
@@ -229,6 +247,30 @@ export async function processVideoFile(
           video.play().catch(reject);
         });
       });
+
+      // 【静止時・冒頭欠落保証】もし冒頭（0.0s）にフレームがなければ最初の有効姿勢を0.0sへバックフィル
+      if (frames.length > 0) {
+        // タイムスタンプ順にソート（念のため）
+        frames.sort((a, b) => a.timestamp - b.timestamp);
+
+        if (frames[0].timestamp > 0.02) {
+          frames.unshift({
+            timestamp: 0.0,
+            landmarks: frames[0].landmarks,
+            angles: frames[0].angles,
+          });
+        }
+
+        // 末尾（duration）にも最終有効フレームを配置（終端静止保証）
+        const lastFrame = frames[frames.length - 1];
+        if (lastFrame.timestamp < duration - 0.05) {
+          frames.push({
+            timestamp: Math.round(duration * 1000) / 1000,
+            landmarks: lastFrame.landmarks,
+            angles: lastFrame.angles,
+          });
+        }
+      }
 
       // 完了通知
       if (onProgress) {

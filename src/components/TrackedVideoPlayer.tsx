@@ -1,8 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Maximize2, Pause, Play, RotateCcw, Volume2, VolumeX, X } from 'lucide-react';
-import { getInterpolatedFrame } from '../lib/pose/interpolator';
+import { getSharedPoseLandmarker } from '../lib/pose/landmarker';
 import { drawPoseOnCanvas } from '../lib/pose/renderer';
-import type { DanceSequence } from '../lib/pose/types';
+import type { DanceSequence, NormalizedLandmark } from '../lib/pose/types';
 
 interface TrackedVideoPlayerProps {
   sequence: DanceSequence;
@@ -68,52 +68,72 @@ export const TrackedVideoPlayer: React.FC<TrackedVideoPlayerProps> = ({
     }
   };
 
-  // 骨格オーバーレイ描画ループ
+  // 骨格オーバーレイ描画ループ（動画フレームから直接リアルタイム推論）
   useEffect(() => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
     if (!video || !canvas) return;
 
     let animId: number;
+    let isMounted = true;
+    let lastLandmarks: NormalizedLandmark[] | null = null;
+    let lastInferredTime = -1;
 
-    const loop = () => {
-      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-        if (video.videoWidth > 0 && video.videoHeight > 0) {
-          if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
+    getSharedPoseLandmarker().then((landmarker) => {
+      if (!isMounted) return;
+
+      const loop = () => {
+        if (!isMounted) return;
+
+        if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+          if (video.videoWidth > 0 && video.videoHeight > 0) {
+            if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+              canvas.width = video.videoWidth;
+              canvas.height = video.videoHeight;
+            }
           }
-        }
 
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          const ctx = canvas.getContext('2d');
+          if (ctx && canvas.width > 0 && canvas.height > 0) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-          const t = video.currentTime;
-          setCurrentTime(t);
+            const t = video.currentTime;
+            setCurrentTime(t);
 
-          if (sequence.frames.length > 0) {
-            // 線形補間（Lerp）により現在時刻の骨格座標を滑らかに算出
-            const interpolated = getInterpolatedFrame(sequence.frames, t);
-            if (interpolated) {
-              drawPoseOnCanvas(ctx, interpolated.landmarks, {
+            // 前回の推論時刻と異なる場合のみ直接推論を実行（カメラと同一処理）
+            if (Math.abs(t - lastInferredTime) > 0.02 || !isPlaying) {
+              lastInferredTime = t;
+              try {
+                const res = landmarker.detect(video);
+                if (res.landmarks && res.landmarks.length > 0) {
+                  lastLandmarks = res.landmarks[0] as NormalizedLandmark[];
+                }
+              } catch (err) {
+                // スキップ
+              }
+            }
+
+            // 直接検出された骨格を描画（カメラと完全に同一の精度）
+            if (lastLandmarks) {
+              drawPoseOnCanvas(ctx, lastLandmarks, {
                 mirror: false,
                 glowEffect: true,
               });
             }
           }
         }
-      }
+
+        animId = requestAnimationFrame(loop);
+      };
 
       animId = requestAnimationFrame(loop);
-    };
-
-    animId = requestAnimationFrame(loop);
+    });
 
     return () => {
-      cancelAnimationFrame(animId);
+      isMounted = false;
+      if (animId) cancelAnimationFrame(animId);
     };
-  }, [sequence]);
+  }, [isPlaying]);
 
   // 初回自動再生
   useEffect(() => {
