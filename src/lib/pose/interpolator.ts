@@ -107,3 +107,47 @@ export function getInterpolatedFrame(
     angles: interpolateAngles(frameA.angles, frameB.angles, clampedFactor),
   };
 }
+
+/**
+ * 【最高速・歪みゼロ】二分探索で指定時刻に最も近い実測フレームを取得する
+ * 計算量O(log N)（約0.0001ms）。架空の補間座標を作らないため、関節の伸び縮みや不自然な歪みが原理的に起きない。
+ */
+export function findClosestFrame(
+  frames: PoseFrameData[],
+  currentTime: number
+): { landmarks: NormalizedLandmark[]; angles: JointAngles } | null {
+  if (!frames || frames.length === 0) return null;
+  if (frames.length === 1) return { landmarks: frames[0].landmarks, angles: frames[0].angles };
+
+  const first = frames[0];
+  const last = frames[frames.length - 1];
+
+  if (currentTime <= first.timestamp) return { landmarks: first.landmarks, angles: first.angles };
+  if (currentTime >= last.timestamp) return { landmarks: last.landmarks, angles: last.angles };
+
+  let low = 0;
+  let high = frames.length - 1;
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    if (frames[mid].timestamp === currentTime) {
+      return { landmarks: frames[mid].landmarks, angles: frames[mid].angles };
+    }
+    if (frames[mid].timestamp < currentTime) {
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  // low と high のうち、currentTime に時間差が小さい方を採用
+  const idxA = Math.max(0, Math.min(frames.length - 1, high));
+  const idxB = Math.max(0, Math.min(frames.length - 1, low));
+
+  const diffA = Math.abs(frames[idxA].timestamp - currentTime);
+  const diffB = Math.abs(frames[idxB].timestamp - currentTime);
+
+  const best = diffA <= diffB ? frames[idxA] : frames[idxB];
+  return { landmarks: best.landmarks, angles: best.angles };
+}
+
