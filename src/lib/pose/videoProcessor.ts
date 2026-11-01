@@ -28,7 +28,7 @@ export async function processVideoFile(
   const {
     fps = 15,
     maxResolution: _maxResolution = 480,
-    playbackSpeed = 2.0,
+    playbackSpeed: _playbackSpeed = 2.0,
     onInitialized,
     onProgress,
   } = options;
@@ -98,159 +98,85 @@ export async function processVideoFile(
     const landmarker = await createPoseLandmarkerInstance('IMAGE');
 
     const frames: PoseFrameData[] = [];
-    let lastExtractedTime = -1;
     let lastReportedPercent = 0;
+    const stepInterval = minInterval; // 確実なサンプリング間隔（1 / fps）
+    let currentTime = 0;
 
     try {
-      // 【最重要】動画再生前に0.0秒の静止フレームを確実にデコード・キャプチャ（video直接推論）
-      try {
-        video.currentTime = 0;
+      video.pause();
+
+      while (currentTime <= duration) {
+        const targetTime = Math.round(currentTime * 1000) / 1000;
+
+        // 1. 指定時刻へ確実に同期シーク（デコード確定待ち）
+        video.currentTime = targetTime;
         await new Promise<void>((resolve) => {
-          if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-            resolve();
-          } else {
-            const onReady = () => {
-              video.removeEventListener('loadeddata', onReady);
-              video.removeEventListener('seeked', onReady);
+          let isDone = false;
+          let timer: number | null = null;
+
+          const onSeeked = () => {
+            if (!isDone) {
+              isDone = true;
+              if (timer) clearTimeout(timer);
+              video.removeEventListener('seeked', onSeeked);
+              // requestAnimationFrameでGPUピクセル確定を確実に待機
+              requestAnimationFrame(() => resolve());
+            }
+          };
+
+          video.addEventListener('seeked', onSeeked, { once: true });
+          // 最大300ms安全タイムアウト
+          timer = window.setTimeout(() => {
+            if (!isDone) {
+              isDone = true;
+              video.removeEventListener('seeked', onSeeked);
               resolve();
-            };
-            video.addEventListener('loadeddata', onReady, { once: true });
-            video.addEventListener('seeked', onReady, { once: true });
-            setTimeout(resolve, 300);
-          }
+            }
+          }, 300);
         });
 
-        // 0.0秒時点の直接骨格検出
-        const initResult = landmarker.detect(video);
-        if (initResult.landmarks && initResult.landmarks.length > 0) {
-          const rawLandmarks = initResult.landmarks[0] as NormalizedLandmark[];
-          const angles = extractJointAngles(rawLandmarks);
-          if (angles) {
-            frames.push({
-              timestamp: 0,
-              landmarks: rawLandmarks,
-              angles,
-            });
-            lastExtractedTime = 0;
-          }
-        }
-      } catch (initErr) {
-        console.warn('Initial frame (0.0s) capture warning:', initErr);
-      }
+        // 2. 確定した静止フレームからMediaPipe骨格検出（動画は停止中のためズレ・ラグが原理的にゼロ）
+        try {
+          const result = landmarker.detect(video);
+          if (result.landmarks && result.landmarks.length > 0) {
+            const rawLandmarks = result.landmarks[0] as NormalizedLandmark[];
+            const angles = extractJointAngles(rawLandmarks);
 
-      // 再生速度を設定（ブラウザが対応していれば2倍速で素早く走査）
-      video.playbackRate = playbackSpeed;
-
-      await new Promise<void>((resolve, reject) => {
-        let isCompleted = false;
-        let stalledTimer: number | null = null;
-
-        const finish = () => {
-          if (isCompleted) return;
-          isCompleted = true;
-          if (stalledTimer) clearTimeout(stalledTimer);
-          video.pause();
-          resolve();
-        };
-
-        const processCurrentFrame = () => {
-          if (isCompleted) return;
-
-          const t = video.currentTime;
-
-          // 最低インターバルごとにフレームをサンプリング
-          if (lastExtractedTime < 0 || t - lastExtractedTime >= minInterval || t >= duration - 0.05) {
-            lastExtractedTime = t;
-
-            // MediaPipe骨格検出（videoから直接推論）
-            try {
-              const result = landmarker.detect(video);
-              if (result.landmarks && result.landmarks.length > 0) {
-                const rawLandmarks = result.landmarks[0] as NormalizedLandmark[];
-                const angles = extractJointAngles(rawLandmarks);
-
-                if (angles) {
-                  frames.push({
-                    timestamp: Math.round(t * 1000) / 1000,
-                    landmarks: rawLandmarks,
-                    angles,
-                  });
-                }
-              }
-            } catch (inferErr) {
-              console.warn('Frame detection warning at', t, inferErr);
-            }
-
-            // 3. 進捗率の単調増加通知
-            const rawPercent = Math.min(100, Math.floor((t / duration) * 100));
-            const safePercent = Math.max(lastReportedPercent, rawPercent);
-            lastReportedPercent = safePercent;
-
-            if (onProgress) {
-              onProgress({
-                currentSeconds: t,
-                totalSeconds: duration,
-                progressPercent: safePercent,
-                framesExtracted: frames.length,
+            if (angles) {
+              frames.push({
+                timestamp: targetTime,
+                landmarks: rawLandmarks,
+                angles,
               });
             }
           }
-
-          // 終端到達判定
-          if (video.ended || t >= duration - 0.05) {
-            finish();
-          }
-        };
-
-        // requestVideoFrameCallback が利用可能な場合（全モダンブラウザ）
-        if ('requestVideoFrameCallback' in video) {
-          const onFrameCallback = () => {
-            if (isCompleted) return;
-            processCurrentFrame();
-            if (!isCompleted) {
-              video.requestVideoFrameCallback(onFrameCallback);
-            }
-          };
-          video.requestVideoFrameCallback(onFrameCallback);
-        } else {
-          // フォールバック: requestAnimationFrame
-          const rafLoop = () => {
-            if (isCompleted) return;
-            processCurrentFrame();
-            if (!isCompleted) {
-              requestAnimationFrame(rafLoop);
-            }
-          };
-          requestAnimationFrame(rafLoop);
+        } catch (inferErr) {
+          console.warn('Frame detection warning at', targetTime, inferErr);
         }
 
-        // イベントリスナー
-        video.onended = finish;
-        video.onerror = () => {
-          if (!isCompleted) {
-            reject(new Error('Video playback error during analysis'));
-          }
-        };
+        // 3. 進捗率の単調増加通知
+        const rawPercent = Math.min(100, Math.floor((targetTime / duration) * 100));
+        const safePercent = Math.max(lastReportedPercent, rawPercent);
+        lastReportedPercent = safePercent;
 
-        // 万が一のスタック防止タイマー（duration / playbackSpeed + 6秒）
-        const maxWaitMs = Math.max(10000, (duration / playbackSpeed) * 1000 + 6000);
-        stalledTimer = window.setTimeout(() => {
-          console.warn('Playback scan reached timeout safety margin. Finalizing frames.');
-          finish();
-        }, maxWaitMs);
+        if (onProgress) {
+          onProgress({
+            currentSeconds: targetTime,
+            totalSeconds: duration,
+            progressPercent: safePercent,
+            framesExtracted: frames.length,
+          });
+        }
 
-        // 再生開始
-        video.currentTime = 0;
-        video.play().catch((playErr) => {
-          console.warn('Autoplay error, attempting retry:', playErr);
-          // ユーザー操作後であれば muted なので成功する
-          video.play().catch(reject);
-        });
-      });
+        // 次のステップ時刻へ前進
+        currentTime += stepInterval;
 
-      // 【静止時・冒頭欠落保証】もし冒頭（0.0s）にフレームがなければ最初の有効姿勢を0.0sへバックフィル
+        // UIレンダリングのための極小マイクロタスク
+        await new Promise((r) => setTimeout(r, 0));
+      }
+
+      // 【静止時・冒頭欠落保証】0.0sと末尾durationの確実な補完
       if (frames.length > 0) {
-        // タイムスタンプ順にソート（念のため）
         frames.sort((a, b) => a.timestamp - b.timestamp);
 
         if (frames[0].timestamp > 0.02) {
@@ -261,7 +187,6 @@ export async function processVideoFile(
           });
         }
 
-        // 末尾（duration）にも最終有効フレームを配置（終端静止保証）
         const lastFrame = frames[frames.length - 1];
         if (lastFrame.timestamp < duration - 0.05) {
           frames.push({
